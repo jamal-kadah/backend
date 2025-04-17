@@ -16,10 +16,10 @@ const CLIENT_SECRET =
   "ELbbAZJaTc97p8Bt6nWsRbfcF8ESsETByHml2WWRoTgO40Sa4964Dxf5u9wm610k4og2l6mQaVti-MOL";
 const PAYPAL_API = "https://api-m.paypal.com";
 
-// Speichert bezahlte Sessions
+// In‑Memory Storage für bezahlte Sessions (für Produktion: echte DB)
 const paidSessions = new Set();
 
-// Holt Access Token von PayPal
+// Hilfsfunktion: holt Access Token von PayPal
 async function getAccessToken() {
   const auth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
   const res = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
@@ -30,63 +30,103 @@ async function getAccessToken() {
     },
     body: "grant_type=client_credentials",
   });
-  const data = await res.json();
-  return data.access_token;
+  const { access_token } = await res.json();
+  return access_token;
 }
 
-// Erstellt eine Checkout-Session
+// 1) Checkout-Session anlegen
 app.post("/create-checkout-session", async (req, res) => {
-  const accessToken = await getAccessToken();
-  const sessionId = uuidv4();
+  try {
+    const accessToken = await getAccessToken();
+    const sessionId = uuidv4();
 
-  const orderRes = await fetch(`${PAYPAL_API}/v2/checkout/orders`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({
-      intent: "CAPTURE",
-      purchase_units: [
-        {
-          amount: { currency_code: "EUR", value: "4.99" },
-          invoice_id: sessionId, // Kommt später im Webhook zurück
-        },
-      ],
-      application_context: {
-        return_url: `https://rechnungsgenerator-xi.vercel.app/?session_id=${sessionId}`,
-        cancel_url: "https://rechnungsgenerator-xi.vercel.app",
+    const orderRes = await fetch(`${PAYPAL_API}/v2/checkout/orders`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
       },
-    }),
-  });
+      body: JSON.stringify({
+        intent: "CAPTURE",
+        purchase_units: [
+          {
+            amount: { currency_code: "EUR", value: "4.99" },
+            invoice_id: sessionId,
+          },
+        ],
+        application_context: {
+          return_url: `https://rechnungsgenerator-xi.vercel.app/?session_id=${sessionId}`,
+          cancel_url: "https://rechnungsgenerator-xi.vercel.app",
+          landing_page: "LOGIN",
+        },
+      }),
+    });
 
-  const order = await orderRes.json();
-  const approveLink = order?.links?.find((x) => x.rel === "approve")?.href;
-  res.json({ url: approveLink });
-});
+    const orderData = await orderRes.json();
+    console.log("🚀 PayPal Order Response:", orderData);
 
-// Webhook-Endpoint für PayPal
-app.post("/paypal/webhook", express.json({ type: "*/*" }), async (req, res) => {
-  const event = req.body;
-
-  if (event.event_type === "PAYMENT.CAPTURE.COMPLETED") {
-    const sessionId = event.resource?.invoice_id;
-    if (sessionId) {
-      paidSessions.add(sessionId);
-      console.log("✅ Zahlung bestätigt für Session:", sessionId);
-    }
+    const approveLink = orderData.links?.find((l) => l.rel === "approve")?.href;
+    res.json({
+      url: approveLink,
+      orderId: orderData.id,
+      sessionId,
+    });
+  } catch (err) {
+    console.error("❌ Error creating checkout session:", err);
+    res.status(500).json({ error: "Checkout session creation failed" });
   }
-
-  res.sendStatus(200);
 });
 
-// Session-Check-Route für Frontend
+// 2) Capture-Endpoint: zieht nach User‑Approval das Geld ein
+app.post("/capture-order", async (req, res) => {
+  const { orderId, sessionId } = req.body;
+  try {
+    const accessToken = await getAccessToken();
+    const captureRes = await fetch(
+      `${PAYPAL_API}/v2/checkout/orders/${orderId}/capture`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+    const captureData = await captureRes.json();
+    console.log("💰 Capture Response:", captureData);
+
+    if (captureRes.ok) {
+      paidSessions.add(sessionId);
+      return res.json({ success: true });
+    } else {
+      return res.status(400).json({ success: false, error: captureData });
+    }
+  } catch (err) {
+    console.error("❌ Error capturing order:", err);
+    res.status(500).json({ error: "Order capture failed" });
+  }
+});
+
+// 3) (Optional) Direkt validieren, ob Session bezahlt ist
 app.get("/paypal/validate", (req, res) => {
   const { session_id } = req.query;
   res.json({ valid: paidSessions.has(session_id) });
 });
 
-// Start
+// 4) (Optional) Webhook-Endpoint, falls du später Webhooks brauchst
+app.post("/paypal/webhook", express.json({ type: "*/*" }), (req, res) => {
+  const event = req.body;
+  if (event.event_type === "PAYMENT.CAPTURE.COMPLETED") {
+    const sid = event.resource?.invoice_id;
+    if (sid) {
+      paidSessions.add(sid);
+      console.log("✅ Webhook: Zahlung bestätigt für Session:", sid);
+    }
+  }
+  res.sendStatus(200);
+});
+
+// Server starten
 app.listen(PORT, () => {
-  console.log("✅ Backend läuft auf Port", PORT);
+  console.log(`✅ Backend läuft auf Port ${PORT}`);
 });
